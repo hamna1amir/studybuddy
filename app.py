@@ -132,8 +132,10 @@ def load_collection():
 
 @st.cache_resource
 def load_groq_client():
+    # Try Streamlit Cloud secrets first, fall back to local .env
+    api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
     return OpenAI(
-        api_key=os.getenv("GROQ_API_KEY"),
+        api_key=api_key,
         base_url="https://api.groq.com/openai/v1"
     )
 
