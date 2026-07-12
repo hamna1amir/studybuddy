@@ -9,19 +9,118 @@ import platform
 from pypdf import PdfReader
 import pytesseract
 from pdf2image import convert_from_path
+from concurrent.futures import ThreadPoolExecutor
 
 load_dotenv()
 
-st.set_page_config(page_title="Course Book Assistant", page_icon="📚")
+st.set_page_config(page_title="StudyBuddy", page_icon="🎓", layout="wide")
 
-# --- OCR tool paths (Windows local vs Linux/Streamlit Cloud) ---
+# --- Custom CSS ---
+st.markdown("""
+<style>
+    .block-container {
+        padding-top: 2rem;
+        padding-bottom: 3rem;
+        max-width: 900px;
+    }
+    .hero {
+        background: linear-gradient(135deg, #FF6F61 0%, #B98CE8 100%);
+        padding: 2.2rem 2rem;
+        border-radius: 20px;
+        margin-bottom: 1.8rem;
+        box-shadow: 0 8px 24px rgba(185, 140, 232, 0.25);
+    }
+    .hero h1 {
+        color: white !important;
+        font-size: 2.2rem;
+        margin: 0;
+        font-weight: 800;
+    }
+    .hero p {
+        color: rgba(255,255,255,0.92);
+        font-size: 1.05rem;
+        margin-top: 0.4rem;
+        margin-bottom: 0;
+    }
+    section[data-testid="stSidebar"] {
+        background-color: #F8F3FF;
+    }
+    section[data-testid="stSidebar"] .stButton button {
+        border-radius: 10px;
+    }
+    .lib-chip {
+        background: white;
+        border: 1px solid #E8D9FF;
+        border-radius: 10px;
+        padding: 0.5rem 0.8rem;
+        margin-bottom: 0.4rem;
+        font-size: 0.9rem;
+        color: #2D2A3E;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        background-color: #F8F3FF;
+        border-radius: 10px 10px 0 0;
+        padding: 10px 20px;
+        font-weight: 600;
+    }
+    .stTabs [aria-selected="true"] {
+        background-color: #FF6F61 !important;
+        color: white !important;
+    }
+    .stChatInput textarea {
+        border-radius: 14px !important;
+    }
+    .stButton button {
+        border-radius: 10px;
+        font-weight: 600;
+    }
+    .summary-card {
+        background: #FDFBFF;
+        border: 1px solid #EEE3FF;
+        border-radius: 16px;
+        padding: 1.5rem;
+        margin-top: 0.5rem;
+    }
+    [data-testid="stChatMessage"] {
+        background: white;
+        border: 1px solid #EEE3FF;
+        border-radius: 16px;
+        padding: 0.9rem 1.1rem;
+        margin-bottom: 0.6rem;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.03);
+    }
+    [data-testid="stChatMessage"] p:has(strong:first-child) {
+        margin-top: 0.6rem;
+        padding-top: 0.5rem;
+        border-top: 1px dashed #E8D9FF;
+        font-size: 0.82rem;
+        color: #8B7A9E;
+    }
+    hr {
+        margin: 0.6rem 0 !important;
+        border-color: #EEE3FF !important;
+    }
+    .book-selector-label {
+        font-size: 0.85rem;
+        color: #8B7A9E;
+        margin-bottom: 0.3rem;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- OCR tool paths ---
 if platform.system() == "Windows":
     pytesseract.pytesseract.tesseract_cmd = r"D:\tesse\tesseract.exe"
     POPPLER_PATH = r"D:\Release-26.02.0-0\poppler-26.02.0\Library\bin"
 else:
-    POPPLER_PATH = None  # Linux server uses packages.txt-installed system tools
+    POPPLER_PATH = None
 
-# --- Cached resources (load once) ---
+# --- Cached resources ---
 @st.cache_resource
 def load_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
@@ -42,13 +141,12 @@ model = load_model()
 collection = load_collection()
 groq_client = load_groq_client()
 
-# --- PDF processing functions (with OCR fallback) ---
+# --- PDF processing ---
 def extract_pages_from_pdf(pdf_path, filename):
     reader = PdfReader(pdf_path)
     pages = []
     needs_ocr_pages = []
 
-    # First pass: try normal text extraction
     for i, page in enumerate(reader.pages):
         text = page.extract_text()
         if text and text.strip():
@@ -56,13 +154,19 @@ def extract_pages_from_pdf(pdf_path, filename):
         else:
             needs_ocr_pages.append(i + 1)
 
-    # Second pass: OCR any pages that had no extractable text
     if needs_ocr_pages:
         st.sidebar.write(f"Running OCR on {len(needs_ocr_pages)} scanned page(s)...")
-        images = convert_from_path(pdf_path, poppler_path=POPPLER_PATH)
-        for page_num in needs_ocr_pages:
+        images = convert_from_path(pdf_path, dpi=150, poppler_path=POPPLER_PATH)
+
+        def ocr_one_page(page_num):
             img = images[page_num - 1]
-            ocr_text = pytesseract.image_to_string(img)
+            text = pytesseract.image_to_string(img)
+            return (page_num, text)
+
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(ocr_one_page, needs_ocr_pages))
+
+        for page_num, ocr_text in results:
             if ocr_text.strip():
                 pages.append({"source": filename, "page_num": page_num, "text": ocr_text})
 
@@ -100,9 +204,15 @@ def is_already_embedded(filename):
     existing = collection.get(where={"source": filename}, limit=1)
     return len(existing["ids"]) > 0
 
-# --- RAG functions ---
-def search(question, n_results=5):
+# --- RAG functions (now with optional book filter) ---
+def search(question, n_results=5, book_filter=None):
     query_embedding = model.encode([question]).tolist()
+    if book_filter and book_filter != "All Books":
+        return collection.query(
+            query_embeddings=query_embedding,
+            n_results=n_results,
+            where={"source": book_filter}
+        )
     return collection.query(query_embeddings=query_embedding, n_results=n_results)
 
 def build_context(results):
@@ -114,12 +224,18 @@ def build_context(results):
         context_parts.append(f"[Source: {source}, Page {page}]\n{text}")
     return "\n\n".join(context_parts)
 
-def ask(question):
-    results = search(question)
+def ask(question, book_filter=None):
+    results = search(question, book_filter=book_filter)
+    if not results["documents"][0]:
+        return "I couldn't find that in the selected book. Try switching to 'All Books' or checking your spelling."
     context = build_context(results)
     prompt = f"""You are a helpful study assistant. Answer the question using ONLY the context below.
 If the answer isn't in the context, say "I couldn't find that in your course materials."
-Always mention which source/page the answer came from.
+
+Format your response EXACTLY like this:
+1. Write a clear, well-organized answer using the context (use bullet points if it helps clarity).
+2. On a new line, add a separator: ---
+3. On the next line, write: **Sources:** followed by a comma-separated list like [book.pdf, p.12], [otherbook.pdf, p.45]
 
 Context:
 {context}
@@ -177,7 +293,8 @@ def get_available_sources():
     return sorted(sources)
 
 # --- Sidebar: Upload ---
-st.sidebar.header("📤 Upload a Book/Notebook")
+st.sidebar.header("📤 Add a Book")
+st.sidebar.caption("Drop in any PDF and StudyBuddy will learn it")
 uploaded_file = st.sidebar.file_uploader("Upload a PDF", type=["pdf"])
 
 if uploaded_file is not None:
@@ -203,36 +320,58 @@ if uploaded_file is not None:
         st.sidebar.success(f"Added {len(chunks)} chunks from {uploaded_file.name}")
 
 st.sidebar.divider()
-st.sidebar.subheader("📖 Available Books")
+st.sidebar.subheader("📚 Your Library")
 sources = get_available_sources()
-for s in sources:
-    st.sidebar.text(f"• {s}")
+if sources:
+    for s in sources:
+        st.sidebar.markdown(f'<div class="lib-chip">📖 {s}</div>', unsafe_allow_html=True)
+else:
+    st.sidebar.caption("No books yet — upload one above.")
 
-# --- Main UI: Tabs for Chat and Summarize ---
-st.title("📚 Course Book Assistant")
+# --- Main UI: Hero header ---
+st.markdown("""
+<div class="hero">
+    <h1>🎓 StudyBuddy</h1>
+    <p>Your friendly study companion — ask questions or get quick summaries from any book you upload</p>
+</div>
+""", unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["💬 Ask Questions", "📝 Summarize Pages"])
+tab1, tab2 = st.tabs(["💬  Chat with StudyBuddy", "📝  Quick Summary"])
 
 with tab1:
+    sources = get_available_sources()
+    book_options = ["All Books"] + sources
+
+    st.markdown('<div class="book-selector-label">📖 Answer from</div>', unsafe_allow_html=True)
+    selected_book = st.selectbox(
+        "Answer from",
+        book_options,
+        label_visibility="collapsed",
+        key="book_filter_select"
+    )
+
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
     for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
+        avatar = "🧑" if msg["role"] == "user" else "🎓"
+        with st.chat_message(msg["role"], avatar=avatar):
             st.markdown(msg["content"])
 
-    if question := st.chat_input("Ask a question about your course materials..."):
+    if question := st.chat_input("Ask StudyBuddy anything about your books..."):
         st.session_state.messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
+        with st.chat_message("user", avatar="🧑"):
             st.markdown(question)
-        with st.chat_message("assistant"):
-            with st.spinner("Searching course materials..."):
-                answer = ask(question)
+        with st.chat_message("assistant", avatar="🎓"):
+            spinner_text = f"Searching {selected_book}..." if selected_book != "All Books" else "Searching your books..."
+            with st.spinner(spinner_text):
+                answer = ask(question, book_filter=selected_book)
             st.markdown(answer)
         st.session_state.messages.append({"role": "assistant", "content": answer})
 
 with tab2:
-    st.subheader("Summarize a Page Range")
+    st.markdown('<div class="summary-card">', unsafe_allow_html=True)
+    st.subheader("Get a Quick Summary")
     sources = get_available_sources()
     if sources:
         selected_source = st.selectbox("Choose a book/file", sources)
@@ -242,9 +381,10 @@ with tab2:
         with col2:
             end_page = st.number_input("End page", min_value=1, value=10)
 
-        if st.button("Summarize"):
+        if st.button("✨ Summarize", use_container_width=True):
             with st.spinner("Summarizing..."):
                 summary = summarize_pages(selected_source, start_page, end_page)
             st.markdown(summary)
     else:
         st.info("Upload a book first to summarize it.")
+    st.markdown('</div>', unsafe_allow_html=True)
